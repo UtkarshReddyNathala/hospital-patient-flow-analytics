@@ -66,3 +66,6 @@ for col_name in expected_cols:
     .start(silver_path)
 )
 
+
+# Run this once to enable tracking
+spark.sql(f"ALTER TABLE delta.`{silver_path}` SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
