@@ -16,15 +16,31 @@ gold_dim_department = "abfss://<<container>>@<<Storageaccount_name>>.core.window
 gold_fact = "abfss://<<container>>@<<Storageaccount_name>>.core.windows.net/<<path>>"
 
 # --- 2. THE INCREMENTAL PROCESSING FUNCTION ---
-# This function is called for every new batch of data from Silver
 def process_incremental_batch(batch_df, batch_id):
     if batch_df.count() == 0:
         return
 
-    # Deduplicate the micro-batch to get the latest snapshot per patient
+    # --- ADVANCEMENT: BUSINESS QUALITY GATE ---
+    # Filter out medically impossible records before they hit Dims or Facts
+    # 1. Discharge cannot be before admission
+    # 2. Age must be in a humanly possible range
+    # 3. Admission cannot be in the future (greater than current time)
+    valid_batch_df = batch_df.filter(
+        (col("discharge_time") >= col("admission_time")) & 
+        (col("age").between(0, 120)) &
+        (col("admission_time") <= current_timestamp()) &
+        (col("patient_id").isNotNull())
+    )
+
+    # Log dropped records for visibility
+    dropped_count = batch_df.count() - valid_batch_df.count()
+    if dropped_count > 0:
+        print(f"BATCH {batch_id}: Dropped {dropped_count} invalid records via Quality Gate.")
+
+    # Deduplicate the valid batch to get the latest snapshot per patient
     w = Window.partitionBy("patient_id").orderBy(F.col("admission_time").desc())
     latest_silver_df = (
-        batch_df
+        valid_batch_df
         .withColumn("row_num", F.row_number().over(w))
         .filter(F.col("row_num") == 1)
         .drop("row_num")
@@ -39,7 +55,6 @@ def process_incremental_batch(batch_df, batch_id):
                             F.coalesce(col("age").cast("string"), lit("NA"))), 256))
                        )
 
-    # Create table if it doesn't exist
     if not DeltaTable.isDeltaTable(spark, gold_dim_patient):
         incoming_patient.withColumn("surrogate_key", F.monotonically_increasing_id()) \
                         .withColumn("effective_to", lit(None).cast("timestamp")) \
@@ -72,17 +87,13 @@ def process_incremental_batch(batch_df, batch_id):
     if new_records_to_insert.count() > 0:
         new_records_to_insert.write.format("delta").mode("append").save(gold_dim_patient)
 
-
-    # --- 4. DEPARTMENT DIMENSION (Lookup Update) ---
+    # --- 4. DEPARTMENT DIMENSION ---
     incoming_dept = (latest_silver_df
                      .select("department", "hospital_id")
                      .dropDuplicates(["department", "hospital_id"])
                      .withColumn("surrogate_key", monotonically_increasing_id())
                     )
-    # We use append/merge for dept if it's large, but here we keep your overwrite for simplicity 
-    # as it's a small lookup.
     incoming_dept.write.format("delta").mode("overwrite").save(gold_dim_department)
-
 
     # --- 5. FACT TABLE ---
     dim_patient_current = (spark.read.format("delta").load(gold_dim_patient)
@@ -115,7 +126,6 @@ def process_incremental_batch(batch_df, batch_id):
                   )
                  )
 
-    # Note: Using 'append' mode because we are only adding new incremental data
     (fact_final.write
         .format("delta")
         .mode("append")
@@ -124,15 +134,14 @@ def process_incremental_batch(batch_df, batch_id):
     )
 
 # --- 6. TRIGGER THE INCREMENTAL LOAD ---
-# This looks for changes in Silver and processes them using the function above
 (spark.readStream
     .format("delta")
-    .option("readChangeData", "true") # Enabled by your ALTER TABLE command in Silver
+    .option("readChangeData", "true") 
     .load(silver_path)
     .writeStream
     .foreachBatch(process_incremental_batch)
-    .option("checkpointLocation", gold_fact + "/_checkpoints/gold_logic")
-    .trigger(availableNow=True) # Processes all available data and then stops
+    .option("checkpointLocation", gold_fact + "/_checkpoints/gold_logic_v2")
+    .trigger(availableNow=True) 
     .start()
     .awaitTermination()
 )
